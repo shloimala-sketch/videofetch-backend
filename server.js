@@ -5,36 +5,25 @@ const { create } = require('youtube-dl-exec');
 const https = require('https');
 const http = require('http');
 const { execSync } = require('child_process');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Find the Nix-installed yt-dlp binary ────────────────────────
-let ytDlpBin = 'yt-dlp';
-try {
-  ytDlpBin = execSync('which yt-dlp').toString().trim().split('\n')[0];
-  console.log('Found yt-dlp at:', ytDlpBin);
-} catch (e) {
-  console.warn('Could not find yt-dlp via which, trying known paths...');
-  const knownPaths = [
-    '/usr/bin/yt-dlp',
-    '/usr/local/bin/yt-dlp',
-    '/run/current-system/sw/bin/yt-dlp',
-  ];
-  for (const p of knownPaths) {
-    try {
-      execSync(`test -f ${p}`);
-      ytDlpBin = p;
-      console.log('Found yt-dlp at:', p);
-      break;
-    } catch (_) {}
-  }
+// ── Use locally downloaded yt-dlp binary ────────────────────────
+const LOCAL_YTDLP = path.join(__dirname, 'yt-dlp');
+let ytDlpBin = LOCAL_YTDLP;
+
+if (fs.existsSync(LOCAL_YTDLP)) {
+  console.log('Using local yt-dlp binary:', LOCAL_YTDLP);
+} else {
+  console.warn('Local yt-dlp not found! Falling back to PATH');
+  ytDlpBin = 'yt-dlp';
 }
 
-// ── Create youtube-dl-exec instance using the Nix binary ────────
 const youtubedl = create(ytDlpBin);
-console.log('Using yt-dlp binary:', ytDlpBin);
 
 // ── YouTube API client ──────────────────────────────────────────
 const youtube = google.youtube({
@@ -92,11 +81,12 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ── GET /ytdlp-check  (debug: confirm binary works) ────────────
-app.get('/ytdlp-check', async (req, res) => {
+// ── GET /ytdlp-check ────────────────────────────────────────────
+app.get('/ytdlp-check', (req, res) => {
   try {
     const version = execSync(`${ytDlpBin} --version`).toString().trim();
-    res.json({ ok: true, binary: ytDlpBin, version });
+    const exists = fs.existsSync(LOCAL_YTDLP);
+    res.json({ ok: true, binary: ytDlpBin, version, localFileExists: exists });
   } catch (err) {
     res.status(500).json({ ok: false, binary: ytDlpBin, error: err.message });
   }
@@ -122,7 +112,6 @@ app.post('/download', async (req, res) => {
     if (!directUrl) throw new Error('No direct URL in video info');
 
     console.log(`Got direct URL for: ${info.title}`);
-    console.log(`Format: ${info.format} ext: ${info.ext}`);
 
     const protocol = directUrl.startsWith('https') ? https : http;
 
@@ -138,13 +127,11 @@ app.post('/download', async (req, res) => {
       },
       (videoRes) => {
         console.log(`Streaming video - HTTP ${videoRes.statusCode}`);
-
         res.setHeader('Content-Type', videoRes.headers['content-type'] || 'video/mp4');
         res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
         if (videoRes.headers['content-length']) {
           res.setHeader('Content-Length', videoRes.headers['content-length']);
         }
-
         videoRes.pipe(res);
         videoRes.on('error', (err) => {
           console.error('Video response error:', err.message);
@@ -156,7 +143,7 @@ app.post('/download', async (req, res) => {
     videoReq.on('error', (err) => {
       console.error('Proxy error:', err.message);
       if (!res.headersSent)
-        res.status(500).json({ error:  'Proxy failed', details: err.message });
+        res.status(500).json({ error: 'Proxy failed', details: err.message });
     });
 
   } catch (err) {
@@ -168,11 +155,14 @@ app.post('/download', async (req, res) => {
 });
 
 // ── Health check ────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', ytDlpBin }));
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', ytDlpBin, localBinaryExists: fs.existsSync(LOCAL_YTDLP) });
+});
 
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`VideoFetch backend running on port ${PORT}`);
   console.log(`yt-dlp binary: ${ytDlpBin}`);
+  console.log(`Local binary exists: ${fs.existsSync(LOCAL_YTDLP)}`);
 });
