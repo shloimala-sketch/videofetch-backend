@@ -5,10 +5,46 @@ const YTDlpWrap = require('yt-dlp-wrap').default;
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ── Find yt-dlp binary ──────────────────────────────────────────
+function findYtDlp() {
+  const locations = [
+    'yt-dlp',
+    '/usr/bin/yt-dlp',
+    '/usr/local/bin/yt-dlp',
+    '/nix/store',
+  ];
+
+  // Try to find via which command
+  try {
+    const result = execSync('which yt-dlp').toString().trim();
+    if (result) {
+      console.log('Found yt-dlp at:', result);
+      return result;
+    }
+  } catch (e) {}
+
+  // Try known locations
+  for (const loc of locations) {
+    try {
+      if (fs.existsSync(loc)) {
+        console.log('Found yt-dlp at:', loc);
+        return loc;
+      }
+    } catch (e) {}
+  }
+
+  console.log('Using default yt-dlp from PATH');
+  return 'yt-dlp';
+}
+
+const ytDlpPath = findYtDlp();
+const ytDlp = new YTDlpWrap(ytDlpPath);
 
 // ── YouTube API client ──────────────────────────────────────────
 const youtube = google.youtube({
@@ -16,9 +52,7 @@ const youtube = google.youtube({
   auth: process.env.YOUTUBE_API_KEY,
 });
 
-const ytDlp = new YTDlpWrap();
-
-// ── Helper: convert ISO 8601 duration to readable format ────────
+// ── Helper: convert ISO 8601 duration ──────────────────────────
 function formatDuration(iso) {
   const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
   if (!match) return '';
@@ -34,7 +68,6 @@ app.get('/search', async (req, res) => {
   if (!q) return res.status(400).json({ error: 'Query is required' });
 
   try {
-    // Step 1: Search for videos
     const searchRes = await youtube.search.list({
       part: ['snippet'],
       q,
@@ -43,11 +76,10 @@ app.get('/search', async (req, res) => {
     });
 
     const items = searchRes.data.items;
-    if (!items || items.length ===  0) return res.json({ results: [] });
+    if (!items || items.length === 0) return res.json({ results: [] });
 
     const videoIds = items.map((item) => item.id.videoId);
 
-    // Step 2: Get durations
     const detailsRes = await youtube.videos.list({
       part: ['contentDetails', 'snippet'],
       id: videoIds,
@@ -64,7 +96,7 @@ app.get('/search', async (req, res) => {
     res.json({ results });
   } catch (err) {
     console.error('Search error:', err.message);
-    res.status(500).json({ error: 'Search failed. Check your API key.' });
+    res.status(500).json({ error: 'Search failed.' });
   }
 });
 
@@ -75,36 +107,58 @@ app.post('/download', async (req, res) => {
 
   const tmpFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp4`);
 
+  console.log(`Starting download for videoId: ${videoId}`);
+  console.log(`Using yt-dlp at: ${ytDlpPath}`);
+  console.log(`Output file: ${tmpFile}`);
+
   try {
-    // Download video up to 720p as mp4
+    // Use single-file format — no merging needed, no ffmpeg required
     await ytDlp.execPromise([
       `https://www.youtube.com/watch?v=${videoId}`,
-      '-f',
-      'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-      '--merge-output-format', 'mp4',
+      '-f', 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
       '--no-playlist',
+      '--no-check-certificate',
       '-o', tmpFile,
     ]);
 
-    // Stream the file back to the client
+    console.log(`Download complete, file exists: ${fs.existsSync(tmpFile)}`);
+
+    if (!fs.existsSync(tmpFile)) {
+      throw new Error('Downloaded file not found');
+    }
+
+    const stat = fs.statSync(tmpFile);
+    console.log(`File size: ${stat.size} bytes`);
+
     res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
 
     const stream = fs.createReadStream(tmpFile);
     stream.pipe(res);
 
-    stream.on('end', () => fs.unlink(tmpFile, () => {}));
-    stream.on('error', () => {
+    stream.on('end', () => {
+      console.log('Stream complete, deleting temp file');
+      fs.unlink(tmpFile, () => {});
+    });
+
+    stream.on('error', (err) => {
+      console.error('Stream error:', err.message);
       fs.unlink(tmpFile, () => {});
       if (!res.headersSent) res.status(500).end();
     });
+
   } catch (err) {
     console.error('Download error:', err.message);
+    console.error('Full error:', err);
     fs.unlink(tmpFile, () => {});
-    res.status(500).json({ error: 'Download failed' });
+    res.status(500).json({ error: 'Download failed', details: err.message });
   }
 });
 
-// ── Start server ────────────────────────────────────────────────
+// ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`VideoFetch backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`VideoFetch backend running on port ${PORT}`);
+  console.log(`yt-dlp path: ${ytDlpPath}`);
+});
