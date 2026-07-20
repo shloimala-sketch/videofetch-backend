@@ -13,6 +13,18 @@ const youtube = google.youtube({
   auth: process.env.YOUTUBE_API_KEY,
 });
 
+// ── ytdl agent with spoofed headers ────────────────────────────
+const agent = ytdl.createProxyAgent(
+  { uri: '' },
+  {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  }
+);
+
 // ── Helper: convert ISO 8601 duration ──────────────────────────
 function formatDuration(iso) {
   const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -50,7 +62,9 @@ app.get('/search', async (req, res) => {
       videoId: item.id,
       title: item.snippet.title,
       channel: item.snippet.channelTitle,
-      thumbnail: item.snippet.thumbnails.medium?.url || item.snippet.thumbnails.default?.url,
+      thumbnail:
+        item.snippet.thumbnails.medium?.url ||
+        item.snippet.thumbnails.default?.url,
       duration: formatDuration(item.contentDetails.duration),
     }));
 
@@ -70,50 +84,86 @@ app.post('/download', async (req, res) => {
   console.log(`Downloading: ${url}`);
 
   try {
-    // Validate video is accessible
     if (!ytdl.validateID(videoId)) {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
-    // Get video info to find best format
-    const info = await ytdl.getInfo(url);
-    console.log(`Video title: ${info.videoDetails.title}`);
-
-    // Pick best mp4 format up to 720p
-    const format = ytdl.chooseFormat(info.formats, {
-      quality: 'highestvideo',
-      filter: (f) =>
-        f.container === 'mp4' &&
-        f.hasVideo &&
-        f.hasAudio &&
-        (f.height || 0) <= 720,
+    // Get info using Android client to avoid IP blocks
+    const info = await ytdl.getInfo(url, {
+      requestOptions: {
+        headers: {
+          'User-Agent':
+            'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
+        },
+      },
     });
 
+    console.log(`Got info for: ${info.videoDetails.title}`);
+    console.log(`Available formats: ${info.formats.length}`);
+
+    // Log available formats for debugging
+    const mp4Formats = info.formats.filter(
+      (f) => f.hasVideo && f.hasAudio && f.container === 'mp4'
+    );
+    console.log(`MP4 combined formats: ${mp4Formats.length}`);
+    mp4Formats.forEach((f) =>
+      console.log(`  ${f.qualityLabel} - ${f.container} - ${f.codecs}`)
+    );
+
+    // Try to get best combined mp4 format (has both audio and video)
+    let format = ytdl.chooseFormat(info.formats, {
+      filter: (f) => f.hasVideo && f.hasAudio && f.container === 'mp4',
+      quality: 'highest',
+    });
+
+    // Fallback 1: any format with audio and video
     if (!format) {
-      // Fallback — just get any mp4 with audio+video
-      const fallback = ytdl.chooseFormat(info.formats, {
+      console.log('No combined mp4, trying any audioandvideo format...');
+      format = ytdl.chooseFormat(info.formats, {
         filter: 'audioandvideo',
       });
-
-      if (!fallback) {
-        return res.status(500).json({ error: 'No suitable video format found' });
-      }
-
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
-      return ytdl(url, { format: fallback }).pipe(res);
     }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
+    // Fallback 2: lowest quality anything
+    if (!format) {
+      console.log('Trying lowest quality fallback...');
+      format = ytdl.chooseFormat(info.formats, { quality: 'lowest' });
+    }
 
-    const stream = ytdl(url, { format });
-    stream.pipe(res);
+    if (!format) {
+      console.error('No format found at all');
+      return res.status(500).json({ error: 'No playable format found for this video' });
+    }
+
+    console.log(`Using format: ${format.qualityLabel} - ${format.container} - ${format.mimeType}`);
+
+    res.setHeader('Content-Type', format.mimeType?.split(';')[0] || 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
+    if (format.contentLength) {
+      res.setHeader('Content-Length', format.contentLength);
+    }
+
+    const stream = ytdl(url, {
+      format,
+      requestOptions: {
+        headers: {
+          'User-Agent':
+            'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
+        },
+      },
+    });
+
+    stream.on('progress', (_, downloaded, total) => {
+      const pct = total ? ((downloaded / total) * 100).toFixed(1) : '?';
+      console.log(`Progress: ${pct}%`);
+    });
 
     stream.on('error', (err) => {
       console.error('Stream error:', err.message);
-      if (!res.headersSent) res.status(500).json({ error: 'Stream failed' });
+      if (!res.headersSent) res.status(500).json({ error: 'Stream failed', details: err.message });
     });
+
+    stream.pipe(res);
 
   } catch (err) {
     console.error('Download error:', err.message);
