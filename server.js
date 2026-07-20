@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
-const youtubedl = require('youtube-dl-exec');
+const { create } = require('youtube-dl-exec');
 const https = require('https');
 const http = require('http');
 const { execSync } = require('child_process');
@@ -10,13 +10,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Find python path and log environment ────────────────────────
+// ── Find the Nix-installed yt-dlp binary ────────────────────────
+let ytDlpBin = 'yt-dlp';
 try {
-  const pythonPath = execSync('which python3 || which python3.11  || which python').toString().trim();
-  console.log('Python found at:', pythonPath);
+  ytDlpBin = execSync('which yt-dlp').toString().trim().split('\n')[0];
+  console.log('Found yt-dlp at:', ytDlpBin);
 } catch (e) {
-  console.warn('Python not found in PATH:', e.message);
+  console.warn('Could not find yt-dlp via which, trying known paths...');
+  const knownPaths = [
+    '/usr/bin/yt-dlp',
+    '/usr/local/bin/yt-dlp',
+    '/run/current-system/sw/bin/yt-dlp',
+  ];
+  for (const p of knownPaths) {
+    try {
+      execSync(`test -f ${p}`);
+      ytDlpBin = p;
+      console.log('Found yt-dlp at:', p);
+      break;
+    } catch (_) {}
+  }
 }
+
+// ── Create youtube-dl-exec instance using the Nix binary ────────
+const youtubedl = create(ytDlpBin);
+console.log('Using yt-dlp binary:', ytDlpBin);
 
 // ── YouTube API client ──────────────────────────────────────────
 const youtube = google.youtube({
@@ -31,7 +49,8 @@ function formatDuration(iso) {
   const h = match[1] ? `${match[1]}:` : '';
   const m = match[2] ? match[2].padStart(h ? 2 : 1, '0') : '0';
   const s = (match[3] || '0').padStart(2, '0');
-  return `${h}${m}:${s}`; }
+  return `${h}${m}:${s}`;
+}
 
 // ── GET /search?q=... ───────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -64,12 +83,22 @@ app.get('/search', async (req, res) => {
         item.snippet.thumbnails.medium?.url ||
         item.snippet.thumbnails.default?.url,
       duration: formatDuration(item.contentDetails.duration),
-     }));
+    }));
 
     res.json({ results });
   } catch (err) {
     console.error('Search error:', err.message);
     res.status(500).json({ error: 'Search failed.' });
+  }
+});
+
+// ── GET /ytdlp-check  (debug: confirm binary works) ────────────
+app.get('/ytdlp-check', async (req, res) => {
+  try {
+    const version = execSync(`${ytDlpBin} --version`).toString().trim();
+    res.json({ ok: true, binary: ytDlpBin, version });
+  } catch (err) {
+    res.status(500).json({ ok: false, binary: ytDlpBin, error: err.message });
   }
 });
 
@@ -82,16 +111,6 @@ app.post('/download', async (req, res) => {
   console.log(`Getting info for: ${url}`);
 
   try {
-    // Find python path dynamically
-    let pythonPath = 'python3';
-    try {
-      pythonPath = execSync('which python3.11 || which python3 || which python')
-        .toString().trim().split('\n')[0];
-      console.log('Using python:', pythonPath);
-    } catch (e) {
-      console.warn('Could not find python, using default');
-    }
-
     const info = await youtubedl(url, {
       dumpSingleJson: true,
       noPlaylist: true,
@@ -100,9 +119,10 @@ app.post('/download', async (req, res) => {
     });
 
     const directUrl = info.url;
-    if (!directUrl) throw new Error('No direct URL found in video info');
+    if (!directUrl) throw new Error('No direct URL in video info');
 
     console.log(`Got direct URL for: ${info.title}`);
+    console.log(`Format: ${info.format} ext: ${info.ext}`);
 
     const protocol = directUrl.startsWith('https') ? https : http;
 
@@ -110,13 +130,14 @@ app.post('/download', async (req, res) => {
       directUrl,
       {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
           Referer: 'https://www.youtube.com/',
           Origin: 'https://www.youtube.com',
         },
       },
       (videoRes) => {
-        console.log(`Proxying video - status: ${videoRes.statusCode}`);
+        console.log(`Streaming video - HTTP ${videoRes.statusCode}`);
 
         res.setHeader('Content-Type', videoRes.headers['content-type'] || 'video/mp4');
         res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
@@ -127,15 +148,15 @@ app.post('/download', async (req, res) => {
         videoRes.pipe(res);
         videoRes.on('error', (err) => {
           console.error('Video response error:', err.message);
-          if (!res.headersSent) res.status(500).json({ error: 'Proxy stream failed' });
+          if (!res.headersSent) res.status(500).json({ error: 'Stream error' });
         });
       }
     );
 
     videoReq.on('error', (err) => {
-      console.error('Proxy request error:', err.message);
+      console.error('Proxy error:', err.message);
       if (!res.headersSent)
-        res.status(500).json({ error: 'Failed to fetch video', details: err.message });
+        res.status(500).json({ error:  'Proxy failed', details: err.message });
     });
 
   } catch (err) {
@@ -147,10 +168,11 @@ app.post('/download', async (req, res) => {
 });
 
 // ── Health check ────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', ytDlpBin }));
 
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`VideoFetch backend running on port ${PORT}`);
+  console.log(`yt-dlp binary: ${ytDlpBin}`);
 });
