@@ -1,33 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
-const YTDlpWrap = require('yt-dlp-wrap').default;
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
+const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── yt-dlp binary path (downloaded on startup) ──────────────────
-const YTDLP_PATH = path.join(os.tmpdir(), 'yt-dlp');
-let ytDlp = null;
-
-async function initYtDlp() {
-  try {
-    // Download yt-dlp binary from GitHub if not already present
-    console.log('Downloading yt-dlp binary...');
-    await YTDlpWrap.downloadFromGithub(YTDLP_PATH);
-    fs.chmodSync(YTDLP_PATH, '755'); // make it executable
-    ytDlp = new YTDlpWrap(YTDLP_PATH);
-    console.log('yt-dlp ready at:', YTDLP_PATH);
-  } catch (err) {
-    console.error('Failed to initialize yt-dlp:', err.message);
-  }
-}
-
-// ── YouTube API client ────────────────────────────────────────── const youtube = google.youtube({
+// ── YouTube API client ──────────────────────────────────────────
+const youtube = google.youtube({
   version: 'v3',
   auth: process.env.YOUTUBE_API_KEY,
 });
@@ -82,52 +63,71 @@ app.get('/search', async (req, res) => {
 
 // ── POST /download  body: { videoId } ──────────────────────────
 app.post('/download', async (req, res) => {
-  if (!ytDlp) {
-    return res.status(503).json({ error: 'Downloader not ready yet, please wait a moment and try again.' });
-  }
-
   const { videoId } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
-  const tmpFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp4`);
-  console.log(`Downloading videoId: ${videoId}`);
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  console.log(`Downloading: ${url}`);
 
   try {
-    await ytDlp.execPromise([
-      `https://www.youtube.com/watch?v=${videoId}`,
-      '-f', 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
-      '--no-playlist',
-      '--no-check-certificate',
-      '-o', tmpFile,
-    ]);
+    // Validate video is accessible
+    if (!ytdl.validateID(videoId)) {
+      return res.status(400).json({ error: 'Invalid video ID' });
+    }
 
-    if (!fs.existsSync(tmpFile)) throw new Error('Downloaded file not found');
+    // Get video info to find best format
+    const info = await ytdl.getInfo(url);
+    console.log(`Video title: ${info.videoDetails.title}`);
 
-    const stat = fs.statSync(tmpFile);
-    console.log(`File ready: ${stat.size} bytes`);
+    // Pick best mp4 format up to 720p
+    const format = ytdl.chooseFormat(info.formats, {
+      quality: 'highestvideo',
+      filter: (f) =>
+        f.container === 'mp4' &&
+        f.hasVideo &&
+        f.hasAudio &&
+        (f.height || 0) <= 720,
+    });
+
+    if (!format) {
+      // Fallback — just get any mp4 with audio+video
+      const fallback = ytdl.chooseFormat(info.formats, {
+        filter: 'audioandvideo',
+      });
+
+      if (!fallback) {
+        return res.status(500).json({ error: 'No suitable video format found' });
+      }
+
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
+      return ytdl(url, { format: fallback }).pipe(res);
+    }
 
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
 
-    const stream = fs.createReadStream(tmpFile);
+    const stream = ytdl(url, { format });
     stream.pipe(res);
-    stream.on('end', () => fs.unlink(tmpFile, () => {}));
-    stream.on('error', () => {
-      fs.unlink(tmpFile, () => {});
-      if (!res.headersSent) res.status(500).end();
+
+    stream.on('error', (err) => {
+      console.error('Stream error:', err.message);
+      if (!res.headersSent) res.status(500).json({ error: 'Stream failed' });
     });
 
   } catch (err) {
     console.error('Download error:', err.message);
-    fs.unlink(tmpFile, () => {});
-    res.status(500).json({ error: 'Download failed', details: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Download failed', details: err.message });
+    }
   }
 });
 
+// ── Health check ────────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`Server running on port ${PORT}`);
-  await initYtDlp(); // download yt-dlp binary on startup
+app.listen(PORT, () => {
+  console.log(`VideoFetch backend running on port ${PORT}`);
 });
