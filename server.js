@@ -4,10 +4,19 @@ const { google } = require('googleapis');
 const youtubedl = require('youtube-dl-exec');
 const https = require('https');
 const http = require('http');
+const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ── Find python path and log environment ────────────────────────
+try {
+  const pythonPath = execSync('which python3 || which python3.11  || which python').toString().trim();
+  console.log('Python found at:', pythonPath);
+} catch (e) {
+  console.warn('Python not found in PATH:', e.message);
+}
 
 // ── YouTube API client ──────────────────────────────────────────
 const youtube = google.youtube({
@@ -22,8 +31,7 @@ function formatDuration(iso) {
   const h = match[1] ? `${match[1]}:` : '';
   const m = match[2] ? match[2].padStart(h ? 2 : 1, '0') : '0';
   const s = (match[3] || '0').padStart(2, '0');
-  return `${h}${m}:${s}`;
-}
+  return `${h}${m}:${s}`; }
 
 // ── GET /search?q=... ───────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -56,7 +64,7 @@ app.get('/search', async (req, res) => {
         item.snippet.thumbnails.medium?.url ||
         item.snippet.thumbnails.default?.url,
       duration: formatDuration(item.contentDetails.duration),
-    }));
+     }));
 
     res.json({ results });
   } catch (err) {
@@ -74,7 +82,16 @@ app.post('/download', async (req, res) => {
   console.log(`Getting info for: ${url}`);
 
   try {
-    // Use yt-dlp to get video info + direct URL (no HTML scraping)
+    // Find python path dynamically
+    let pythonPath = 'python3';
+    try {
+      pythonPath = execSync('which python3.11 || which python3 || which python')
+        .toString().trim().split('\n')[0];
+      console.log('Using python:', pythonPath);
+    } catch (e) {
+      console.warn('Could not find python, using default');
+    }
+
     const info = await youtubedl(url, {
       dumpSingleJson: true,
       noPlaylist: true,
@@ -86,17 +103,14 @@ app.post('/download', async (req, res) => {
     if (!directUrl) throw new Error('No direct URL found in video info');
 
     console.log(`Got direct URL for: ${info.title}`);
-    console.log(`Format: ${info.format} - ${info.ext}`);
 
-    // Proxy the video through our server to the client
     const protocol = directUrl.startsWith('https') ? https : http;
 
     const videoReq = protocol.get(
       directUrl,
       {
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           Referer: 'https://www.youtube.com/',
           Origin: 'https://www.youtube.com',
         },
@@ -104,18 +118,13 @@ app.post('/download', async (req, res) => {
       (videoRes) => {
         console.log(`Proxying video - status: ${videoRes.statusCode}`);
 
-        const contentType = videoRes.headers['content-type'] || 'video/mp4';
-        res.setHeader('Content-Type', contentType);
-        res.setHeader(
-          'Content-Disposition',
-          `attachment; filename="${videoId}.mp4"`
-        );
+        res.setHeader('Content-Type', videoRes.headers['content-type'] || 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
         if (videoRes.headers['content-length']) {
           res.setHeader('Content-Length', videoRes.headers['content-length']);
         }
 
         videoRes.pipe(res);
-
         videoRes.on('error', (err) => {
           console.error('Video response error:', err.message);
           if (!res.headersSent) res.status(500).json({ error: 'Proxy stream failed' });
