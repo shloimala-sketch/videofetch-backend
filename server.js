@@ -5,25 +5,15 @@ const { create } = require('youtube-dl-exec');
 const https = require('https');
 const http = require('http');
 const { execSync } = require('child_process');
-const path = require('path');
 const fs = require('fs');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Use locally downloaded yt-dlp binary ────────────────────────
-const LOCAL_YTDLP = path.join(__dirname, 'yt-dlp');
-let ytDlpBin = LOCAL_YTDLP;
-
-if (fs.existsSync(LOCAL_YTDLP)) {
-  console.log('Using local yt-dlp binary:', LOCAL_YTDLP);
-} else {
-  console.warn('Local yt-dlp not found! Falling back to PATH');
-  ytDlpBin = 'yt-dlp';
-}
-
-const youtubedl = create(ytDlpBin);
+// ── yt-dlp is downloaded to /usr/local/bin/yt-dlp at startup ───
+const YTDLP_BIN = '/usr/local/bin/yt-dlp';
+const youtubedl = create(YTDLP_BIN);
 
 // ── YouTube API client ──────────────────────────────────────────
 const youtube = google.youtube({
@@ -84,11 +74,16 @@ app.get('/search', async (req, res) => {
 // ── GET /ytdlp-check ────────────────────────────────────────────
 app.get('/ytdlp-check', (req, res) => {
   try {
-    const version = execSync(`${ytDlpBin} --version`).toString().trim();
-    const exists = fs.existsSync(LOCAL_YTDLP);
-    res.json({ ok: true, binary: ytDlpBin, version, localFileExists: exists });
+    const exists = fs.existsSync(YTDLP_BIN);
+    const version = execSync(`${YTDLP_BIN} --version`).toString().trim();
+    res.json({ ok: true, binary: YTDLP_BIN, exists, version });
   } catch (err) {
-    res.status(500).json({ ok: false, binary: ytDlpBin, error: err.message });
+    res.status(500).json({
+      ok: false,
+      binary: YTDLP_BIN,
+      exists: fs.existsSync(YTDLP_BIN),
+      error: err.message,
+    });
   }
 });
 
@@ -119,14 +114,13 @@ app.post('/download', async (req, res) => {
       directUrl,
       {
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
           Referer: 'https://www.youtube.com/',
           Origin: 'https://www.youtube.com',
         },
       },
       (videoRes) => {
-        console.log(`Streaming video - HTTP ${videoRes.statusCode}`);
+        console.log(`Streaming - HTTP ${videoRes.statusCode}`);
         res.setHeader('Content-Type', videoRes.headers['content-type'] || 'video/mp4');
         res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
         if (videoRes.headers['content-length']) {
@@ -156,13 +150,12 @@ app.post('/download', async (req, res) => {
 
 // ── Health check ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', ytDlpBin, localBinaryExists: fs.existsSync(LOCAL_YTDLP) });
+  res.json({ status: 'ok', ytdlpExists: fs.existsSync(YTDLP_BIN) });
 });
 
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`VideoFetch backend running on port ${PORT}`);
-  console.log(`yt-dlp binary: ${ytDlpBin}`);
-  console.log(`Local binary exists: ${fs.existsSync(LOCAL_YTDLP)}`);
+  console.log(`VideoFetch running on port ${PORT}`);
+  console.log(`yt-dlp exists: ${fs.existsSync(YTDLP_BIN)}`);
 });
