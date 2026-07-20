@@ -12,16 +12,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-//  ── Standalone yt-dlp Linux binary (NO Python needed) ───────────
+// ── yt-dlp standalone binary  ────────────────────────────────────
 const YTDLP_BIN = path.join(os.tmpdir(), 'yt-dlp-linux');
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 let ytDlpReady = false;
+
+// ── Cookie file path (written from env var) ─────────────────────
+const COOKIE_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
+
+function writeCookies() {
+  const cookies = process.env.YOUTUBE_COOKIES;
+  if (cookies) {
+    fs.writeFileSync(COOKIE_FILE, cookies, 'utf8');
+    console.log('YouTube cookies written to:', COOKIE_FILE);
+  } else {
+    console.warn('No YOUTUBE_COOKIES env var found - bot detection may block downloads');
+  }
+}
 
 async function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
     https.get(url, (response) => {
-      // Handle redirects
       if (response.statusCode === 301 || response.statusCode === 302) {
         file.close();
         fs.unlink(dest, () => {});
@@ -34,30 +46,33 @@ async function downloadFile(url, dest) {
       }
       response.pipe(file);
       file.on('finish', () => file.close(resolve));
-      file.on('error', (err) => {
-        fs.unlink(dest, () => {});
-        reject(err);
-      });
+      file.on('error', (err) => { fs.unlink(dest, () => {}); reject(err); });
     }).on('error', reject);
   });
 }
 
 async function initYtDlp() {
   try {
-    console.log('Downloading yt-dlp standalone Linux binary...');
+    console.log('Downloading yt-dlp standalone binary...');
     await downloadFile(YTDLP_URL, YTDLP_BIN);
     fs.chmodSync(YTDLP_BIN, 0o755);
-    console.log('yt-dlp binary ready at:', YTDLP_BIN);
-    console.log('File size:', fs.statSync(YTDLP_BIN).size, 'bytes');
     ytDlpReady = true;
+    console.log('yt-dlp ready! Size:', fs.statSync(YTDLP_BIN).size, 'bytes');
+    writeCookies();
   } catch (err) {
-    console.error('Failed to download yt-dlp:', err.message);
+    console.error('Failed to init yt-dlp:', err.message);
   }
 }
 
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(YTDLP_BIN, args);
+    // Add cookie file if it exists
+    const allArgs = fs.existsSync(COOKIE_FILE)
+      ? ['--cookies', COOKIE_FILE, ...args]
+      : args;
+
+    console.log('Running yt-dlp with args:', allArgs.join(' '));
+    const proc = spawn(YTDLP_BIN, allArgs);
     let stdout = '';
     let stderr = '';
     proc.stdout.on('data', (d) => (stdout += d.toString()));
@@ -117,24 +132,29 @@ app.get('/search', async (req, res) => {
 app.get('/ytdlp-check', async (req, res) => {
   try {
     const exists = fs.existsSync(YTDLP_BIN);
-    if (!exists) return res.status(500).json({ ok: false, exists, ready: ytDlpReady, binary: YTDLP_BIN });
+    if (!exists) return res.status(500).json({ ok: false, exists, ready: ytDlpReady });
     const version = await runYtDlp(['--version']);
-    res.json({ ok: true, exists, ready: ytDlpReady, binary: YTDLP_BIN, version: version.trim() });
+    res.json({
+      ok: true, exists, ready: ytDlpReady,
+      version: version.trim(),
+      hasCookies: fs.existsSync(COOKIE_FILE),
+    });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message, binary: YTDLP_BIN });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 // ── POST /download ───────────────────────────────────────────────
 app.post('/download', async (req, res) => {
   if (!ytDlpReady) {
-    return res.status(503).json({ error: 'Downloader not ready yet, wait 30 seconds and try again.' });
+    return res.status(503).json({ error: 'Downloader not ready, wait 30 seconds and try again.' });
   }
+
   const { videoId } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  console.log(`Getting info for: ${url}`);
+  console.log(`Downloading: ${url}`);
 
   try {
     const infoJson = await runYtDlp([
@@ -142,6 +162,8 @@ app.post('/download', async (req, res) => {
       '--dump-single-json',
       '--no-playlist',
       '--no-check-certificates',
+      // Use Android client — no JS runtime needed, less bot detection
+      '--extractor-args', 'youtube:player_client=android,web',
       '-f', 'best[height<=720][ext=mp4]/best[ext=mp4]/best[height<=720]/best',
     ]);
 
@@ -149,17 +171,16 @@ app.post('/download', async (req, res) => {
     const directUrl = info.url;
     if (!directUrl) throw new Error('No direct URL found');
 
-    console.log(`Streaming: ${info.title} | ${info.ext} | ${info.format}`);
+    console.log(`Got URL for: ${info.title} | ${info.ext}`);
 
     const protocol = directUrl.startsWith('https') ? https : http;
     const videoReq = protocol.get(directUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
         Referer: 'https://www.youtube.com/',
-        Origin: 'https://www.youtube.com',
       },
     }, (videoRes) => {
-      console.log(`Video HTTP status: ${videoRes.statusCode}`);
+      console.log(`Video HTTP: ${videoRes.statusCode}`);
       res.setHeader('Content-Type', videoRes.headers['content-type'] || 'video/mp4');
       res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
       if (videoRes.headers['content-length']) {
@@ -167,13 +188,11 @@ app.post('/download', async (req, res) => {
       }
       videoRes.pipe(res);
       videoRes.on('error', (err) => {
-        console.error('Stream error:', err.message);
         if (!res.headersSent) res.status(500).json({ error: 'Stream failed' });
       });
     });
 
     videoReq.on('error', (err) => {
-      console.error('Request error:', err.message);
       if (!res.headersSent) res.status(500).json({ error: 'Fetch failed', details: err.message });
     });
 
@@ -183,12 +202,12 @@ app.post('/download', async (req, res) => {
   }
 });
 
-// ── Health ───────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
-  status: 'ok', ytDlpReady, ytDlpExists: fs.existsSync(YTDLP_BIN)
+  status: 'ok', ytDlpReady,
+  hasCookies: fs.existsSync(COOKIE_FILE),
 }));
 
-// ── Start ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`VideoFetch running on port ${PORT}`);
