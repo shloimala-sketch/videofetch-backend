@@ -5,49 +5,29 @@ const YTDlpWrap = require('yt-dlp-wrap').default;
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Find yt-dlp binary ──────────────────────────────────────────
-function findYtDlp() {
-  const locations = [
-    'yt-dlp',
-    '/usr/bin/yt-dlp',
-    '/usr/local/bin/yt-dlp',
-    '/nix/store',
-  ];
+// ── yt-dlp binary path (downloaded on startup) ──────────────────
+const YTDLP_PATH = path.join(os.tmpdir(), 'yt-dlp');
+let ytDlp = null;
 
-  // Try to find via which command
+async function initYtDlp() {
   try {
-    const result = execSync('which yt-dlp').toString().trim();
-    if (result) {
-      console.log('Found yt-dlp at:', result);
-      return result;
-    }
-  } catch (e) {}
-
-  // Try known locations
-  for (const loc of locations) {
-    try {
-      if (fs.existsSync(loc)) {
-        console.log('Found yt-dlp at:', loc);
-        return loc;
-      }
-    } catch (e) {}
+    // Download yt-dlp binary from GitHub if not already present
+    console.log('Downloading yt-dlp binary...');
+    await YTDlpWrap.downloadFromGithub(YTDLP_PATH);
+    fs.chmodSync(YTDLP_PATH, '755'); // make it executable
+    ytDlp = new YTDlpWrap(YTDLP_PATH);
+    console.log('yt-dlp ready at:', YTDLP_PATH);
+  } catch (err) {
+    console.error('Failed to initialize yt-dlp:', err.message);
   }
-
-  console.log('Using default yt-dlp from PATH');
-  return 'yt-dlp';
 }
 
-const ytDlpPath = findYtDlp();
-const ytDlp = new YTDlpWrap(ytDlpPath);
-
-// ── YouTube API client ──────────────────────────────────────────
-const youtube = google.youtube({
+// ── YouTube API client ────────────────────────────────────────── const youtube = google.youtube({
   version: 'v3',
   auth: process.env.YOUTUBE_API_KEY,
 });
@@ -102,17 +82,17 @@ app.get('/search', async (req, res) => {
 
 // ── POST /download  body: { videoId } ──────────────────────────
 app.post('/download', async (req, res) => {
+  if (!ytDlp) {
+    return res.status(503).json({ error: 'Downloader not ready yet, please wait a moment and try again.' });
+  }
+
   const { videoId } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
   const tmpFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp4`);
-
-  console.log(`Starting download for videoId: ${videoId}`);
-  console.log(`Using yt-dlp at: ${ytDlpPath}`);
-  console.log(`Output file: ${tmpFile}`);
+  console.log(`Downloading videoId: ${videoId}`);
 
   try {
-    // Use single-file format — no merging needed, no ffmpeg required
     await ytDlp.execPromise([
       `https://www.youtube.com/watch?v=${videoId}`,
       '-f', 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
@@ -121,14 +101,10 @@ app.post('/download', async (req, res) => {
       '-o', tmpFile,
     ]);
 
-    console.log(`Download complete, file exists: ${fs.existsSync(tmpFile)}`);
-
-    if (!fs.existsSync(tmpFile)) {
-      throw new Error('Downloaded file not found');
-    }
+    if (!fs.existsSync(tmpFile)) throw new Error('Downloaded file not found');
 
     const stat = fs.statSync(tmpFile);
-    console.log(`File size: ${stat.size} bytes`);
+    console.log(`File ready: ${stat.size} bytes`);
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', stat.size);
@@ -136,21 +112,14 @@ app.post('/download', async (req, res) => {
 
     const stream = fs.createReadStream(tmpFile);
     stream.pipe(res);
-
-    stream.on('end', () => {
-      console.log('Stream complete, deleting temp file');
-      fs.unlink(tmpFile, () => {});
-    });
-
-    stream.on('error', (err) => {
-      console.error('Stream error:', err.message);
+    stream.on('end', () => fs.unlink(tmpFile, () => {}));
+    stream.on('error', () => {
       fs.unlink(tmpFile, () => {});
       if (!res.headersSent) res.status(500).end();
     });
 
   } catch (err) {
     console.error('Download error:', err.message);
-    console.error('Full error:', err);
     fs.unlink(tmpFile, () => {});
     res.status(500).json({ error: 'Download failed', details: err.message });
   }
@@ -158,7 +127,7 @@ app.post('/download', async (req, res) => {
 
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`VideoFetch backend running on port ${PORT}`);
-  console.log(`yt-dlp path: ${ytDlpPath}`);
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  await initYtDlp(); // download yt-dlp binary on startup
 });
