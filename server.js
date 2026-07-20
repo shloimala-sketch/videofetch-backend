@@ -1,7 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
-const ytdl = require('@distube/ytdl-core');
+const youtubedl = require('youtube-dl-exec');
+const https = require('https');
+const http = require('http');
 
 const app = express();
 app.use(cors());
@@ -22,11 +24,6 @@ function formatDuration(iso) {
   const s = (match[3] || '0').padStart(2, '0');
   return `${h}${m}:${s}`;
 }
-
-// ── Android client headers (bypasses IP blocks) ─────────────────
-const YT_HEADERS = {
-  'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
-};
 
 // ── GET /search?q=... ───────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -74,56 +71,63 @@ app.post('/download', async (req, res) => {
   if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  console.log(`Downloading: ${url}`);
+  console.log(`Getting info for: ${url}`);
 
   try {
-    if (!ytdl.validateID(videoId)) {
-      return res.status(400).json({ error: 'Invalid video ID' });
-    }
-
-    const info = await ytdl.getInfo(url, {
-      requestOptions: { headers: YT_HEADERS },
+    // Use yt-dlp to get video info + direct URL (no HTML scraping)
+    const info = await youtubedl(url, {
+      dumpSingleJson: true,
+      noPlaylist: true,
+      noCheckCertificates: true,
+      format: 'best[height<=720][ext=mp4]/best[ext=mp4]/best[height<=720]/best',
     });
 
-    console.log(`Got info for: ${info.videoDetails.title}`);
+    const directUrl = info.url;
+    if (!directUrl) throw new Error('No direct URL found in video info');
 
-    // Best combined mp4 (audio + video in one file)
-    let format = ytdl.chooseFormat(info.formats, {
-      filter: (f) => f.hasVideo && f.hasAudio && f.container === 'mp4',
-      quality: 'highest',
-    });
+    console.log(`Got direct URL for: ${info.title}`);
+    console.log(`Format: ${info.format} - ${info.ext}`);
 
-    // Fallback: any combined format
-    if (!format) {
-      format = ytdl.chooseFormat(info.formats, { filter: 'audioandvideo' });
-    }
+    // Proxy the video through our server to the client
+    const protocol = directUrl.startsWith('https') ? https : http;
 
-    if (!format) {
-      return res.status(500).json({ error: 'No playable format found' });
-    }
+    const videoReq = protocol.get(
+      directUrl,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Referer: 'https://www.youtube.com/',
+          Origin: 'https://www.youtube.com',
+        },
+      },
+      (videoRes) => {
+        console.log(`Proxying video - status: ${videoRes.statusCode}`);
 
-    console.log(`Format: ${format.qualityLabel} - ${format.container}`);
+        const contentType = videoRes.headers['content-type'] || 'video/mp4';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${videoId}.mp4"`
+        );
+        if (videoRes.headers['content-length']) {
+          res.setHeader('Content-Length', videoRes.headers['content-length']);
+        }
 
-    const mimeType = format.mimeType?.split(';')[0] || 'video/mp4';
-    res.setHeader('Content-Type', mimeType);
-    res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
-    if (format.contentLength) {
-      res.setHeader('Content-Length', format.contentLength);
-    }
+        videoRes.pipe(res);
 
-    const stream = ytdl(url, {
-      format,
-      requestOptions: { headers: YT_HEADERS },
-    });
-
-    stream.on('error', (err) => {
-      console.error('Stream error:', err.message);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream failed', details: err.message });
+        videoRes.on('error', (err) => {
+          console.error('Video response error:', err.message);
+          if (!res.headersSent) res.status(500).json({ error: 'Proxy stream failed' });
+        });
       }
-    });
+    );
 
-    stream.pipe(res);
+    videoReq.on('error', (err) => {
+      console.error('Proxy request error:', err.message);
+      if (!res.headersSent)
+        res.status(500).json({ error: 'Failed to fetch video', details: err.message });
+    });
 
   } catch (err) {
     console.error('Download error:', err.message);
