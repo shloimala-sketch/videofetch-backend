@@ -13,18 +13,6 @@ const youtube = google.youtube({
   auth: process.env.YOUTUBE_API_KEY,
 });
 
-// ── ytdl agent with spoofed headers ────────────────────────────
-const agent = ytdl.createProxyAgent(
-  { uri: '' },
-  {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  }
-);
-
 // ── Helper: convert ISO 8601 duration ──────────────────────────
 function formatDuration(iso) {
   const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -34,6 +22,11 @@ function formatDuration(iso) {
   const s = (match[3] || '0').padStart(2, '0');
   return `${h}${m}:${s}`;
 }
+
+// ── Android client headers (bypasses IP blocks) ─────────────────
+const YT_HEADERS = {
+  'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
+};
 
 // ── GET /search?q=... ───────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -88,56 +81,31 @@ app.post('/download', async (req, res) => {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
-    // Get info using Android client to avoid IP blocks
     const info = await ytdl.getInfo(url, {
-      requestOptions: {
-        headers: {
-          'User-Agent':
-            'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
-        },
-      },
+      requestOptions: { headers: YT_HEADERS },
     });
 
     console.log(`Got info for: ${info.videoDetails.title}`);
-    console.log(`Available formats: ${info.formats.length}`);
 
-    // Log available formats for debugging
-    const mp4Formats = info.formats.filter(
-      (f) => f.hasVideo && f.hasAudio && f.container === 'mp4'
-    );
-    console.log(`MP4 combined formats: ${mp4Formats.length}`);
-    mp4Formats.forEach((f) =>
-      console.log(`  ${f.qualityLabel} - ${f.container} - ${f.codecs}`)
-    );
-
-    // Try to get best combined mp4 format (has both audio and video)
+    // Best combined mp4 (audio + video in one file)
     let format = ytdl.chooseFormat(info.formats, {
       filter: (f) => f.hasVideo && f.hasAudio && f.container === 'mp4',
       quality: 'highest',
     });
 
-    // Fallback 1: any format with audio and video
+    // Fallback: any combined format
     if (!format) {
-      console.log('No combined mp4, trying any audioandvideo format...');
-      format = ytdl.chooseFormat(info.formats, {
-        filter: 'audioandvideo',
-      });
-    }
-
-    // Fallback 2: lowest quality anything
-    if (!format) {
-      console.log('Trying lowest quality fallback...');
-      format = ytdl.chooseFormat(info.formats, { quality: 'lowest' });
+      format = ytdl.chooseFormat(info.formats, { filter: 'audioandvideo' });
     }
 
     if (!format) {
-      console.error('No format found at all');
-      return res.status(500).json({ error: 'No playable format found for this video' });
+      return res.status(500).json({ error: 'No playable format found' });
     }
 
-    console.log(`Using format: ${format.qualityLabel} - ${format.container} - ${format.mimeType}`);
+    console.log(`Format: ${format.qualityLabel} - ${format.container}`);
 
-    res.setHeader('Content-Type', format.mimeType?.split(';')[0] || 'video/mp4');
+    const mimeType = format.mimeType?.split(';')[0] || 'video/mp4';
+    res.setHeader('Content-Type', mimeType);
     res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
     if (format.contentLength) {
       res.setHeader('Content-Length', format.contentLength);
@@ -145,22 +113,14 @@ app.post('/download', async (req, res) => {
 
     const stream = ytdl(url, {
       format,
-      requestOptions: {
-        headers: {
-          'User-Agent':
-            'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
-        },
-      },
-    });
-
-    stream.on('progress', (_, downloaded, total) => {
-      const pct = total ? ((downloaded / total) * 100).toFixed(1) : '?';
-      console.log(`Progress: ${pct}%`);
+      requestOptions: { headers: YT_HEADERS },
     });
 
     stream.on('error', (err) => {
       console.error('Stream error:', err.message);
-      if (!res.headersSent) res.status(500).json({ error: 'Stream failed', details: err.message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream failed', details: err.message });
+      }
     });
 
     stream.pipe(res);
